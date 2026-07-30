@@ -445,14 +445,10 @@
 
   function setBusy(busy) {
     processing = busy;
-    pickPhotoBtn.disabled = busy;
+    photoInput.disabled = busy;                 // 處理中禁止再開相簿
     pickPhotoBtn.textContent = busy ? '處理中…' : '選擇照片';
-    changePhotoBtn.disabled = busy;
-  }
-
-  function openPicker() {
-    if (processing) return;
-    photoInput.click();
+    pickPhotoBtn.classList.toggle('is-busy', busy);
+    changePhotoBtn.classList.toggle('is-busy', busy);
   }
 
   async function setPhotoFromFile(file) {
@@ -485,20 +481,19 @@
   /* ---------- 事件綁定 ---------- */
 
   shuffleBtn.addEventListener('click', () => {
-    if (!sourceTexture) { openPicker(); return; }
+    if (!sourceTexture) return;      // 還沒選照片時，開始面板會提示
     buildGame();
   });
   playAgainBtn.addEventListener('click', buildGame);
   levelBtn.addEventListener('click', () => {
-    if (!sourceTexture) { openPicker(); return; }
+    if (!sourceTexture) return;
     levelIndex = (levelIndex + 1) % levels.length;
     buildGame();
   });
   bindHoldPreview();
 
-  pickPhotoBtn.addEventListener('click', openPicker);
-  changePhotoBtn.addEventListener('click', openPicker);
-  winChangeBtn.addEventListener('click', openPicker);
+  // 換照片的按鈕都是 <label for="photo-input">，由瀏覽器原生開啟相簿，
+  // 這裡只需處理選好之後的檔案。
   photoInput.addEventListener('change', (event) => {
     const file = event.target.files && event.target.files[0];
     event.target.value = '';   // 允許重複選同一個檔案
