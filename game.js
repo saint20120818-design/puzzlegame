@@ -1,7 +1,6 @@
 (() => {
   'use strict';
 
-  const IMAGE_URL = './puzzle-image.png';
   const levels = [
     { cols: 3, rows: 4 },
     { cols: 4, rows: 5 },
@@ -18,6 +17,13 @@
   const winPanel = document.getElementById('win-panel');
   const winText = document.getElementById('win-text');
   const playAgainBtn = document.getElementById('play-again');
+
+  // 照片相關 UI
+  const startPanel = document.getElementById('start-panel');
+  const pickPhotoBtn = document.getElementById('pick-photo-btn');
+  const changePhotoBtn = document.getElementById('change-photo-btn');
+  const winChangeBtn = document.getElementById('win-change-photo');
+  const photoInput = document.getElementById('photo-input');
 
   const app = new PIXI.Application({
     backgroundAlpha: 0,
@@ -42,6 +48,7 @@
   let started = false;
   let completed = false;
   let previewing = false;
+  let processing = false;
 
   const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
 
@@ -334,13 +341,169 @@
     previewBtn.addEventListener('pointerleave', hide);
   }
 
-  shuffleBtn.addEventListener('click', buildGame);
+  /* ---------- 照片：儲存 / 讀取（IndexedDB） ---------- */
+
+  const DB_NAME = 'puzzle-photo-db';
+  const STORE = 'photo';
+  const KEY = 'current';
+
+  function openDB() {
+    return new Promise((resolve, reject) => {
+      if (!('indexedDB' in window)) { reject(new Error('no indexedDB')); return; }
+      const req = indexedDB.open(DB_NAME, 1);
+      req.onupgradeneeded = () => req.result.createObjectStore(STORE);
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+  }
+
+  async function savePhoto(blob) {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE, 'readwrite');
+      tx.objectStore(STORE).put(blob, KEY);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  }
+
+  async function loadPhoto() {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE, 'readonly');
+      const req = tx.objectStore(STORE).get(KEY);
+      req.onsuccess = () => resolve(req.result || null);
+      req.onerror = () => reject(req.error);
+    });
+  }
+
+  /* ---------- 照片：解碼 / 縮圖 / 轉成材質 ---------- */
+
+  // 用 <img> 解碼（createImageBitmap 不支援時的後備）
+  function loadViaImage(file) {
+    return new Promise((resolve, reject) => {
+      const url = URL.createObjectURL(file);
+      const img = new Image();
+      img.onload = () => { URL.revokeObjectURL(url); resolve(img); };
+      img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('decode failed')); };
+      img.src = url;
+    });
+  }
+
+  // 讀取照片、依 EXIF 轉正、縮到合理大小，輸出壓縮後的 JPEG blob
+  async function processImage(file) {
+    const maxDim = 1600;
+    let drawable;
+    try {
+      drawable = await createImageBitmap(file, { imageOrientation: 'from-image' });
+    } catch (e) {
+      drawable = await loadViaImage(file);
+    }
+
+    const srcW = drawable.width;
+    const srcH = drawable.height;
+    const scale = Math.min(1, maxDim / Math.max(srcW, srcH));
+    const w = Math.max(1, Math.round(srcW * scale));
+    const h = Math.max(1, Math.round(srcH * scale));
+
+    const canvas = document.createElement('canvas');
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(drawable, 0, 0, w, h);
+    if (drawable.close) drawable.close();
+
+    const blob = await new Promise(res => canvas.toBlob(res, 'image/jpeg', 0.85));
+    if (blob) return blob;
+
+    // toBlob 後備：dataURL -> blob
+    const dataUrl = canvas.toDataURL('image/jpeg', 0.85);
+    const res = await fetch(dataUrl);
+    return res.blob();
+  }
+
+  // blob -> PIXI 材質
+  function blobToTexture(blob) {
+    return new Promise((resolve, reject) => {
+      const url = URL.createObjectURL(blob);
+      const img = new Image();
+      img.onload = () => {
+        const texture = PIXI.Texture.from(img);
+        const finish = () => { URL.revokeObjectURL(url); resolve(texture); };
+        if (texture.baseTexture.valid) finish();
+        else texture.baseTexture.once('loaded', finish);
+      };
+      img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('texture load failed')); };
+      img.src = url;
+    });
+  }
+
+  /* ---------- 照片：流程控制 ---------- */
+
+  function showStart() { startPanel.classList.add('show'); }
+  function hideStart() { startPanel.classList.remove('show'); }
+
+  function setBusy(busy) {
+    processing = busy;
+    pickPhotoBtn.disabled = busy;
+    pickPhotoBtn.textContent = busy ? '處理中…' : '選擇照片';
+    changePhotoBtn.disabled = busy;
+  }
+
+  function openPicker() {
+    if (processing) return;
+    photoInput.click();
+  }
+
+  async function setPhotoFromFile(file) {
+    if (!file || processing) return;
+    setBusy(true);
+    try {
+      const blob = await processImage(file);
+      if (!blob) throw new Error('empty blob');
+
+      // 存起來，下次打開沿用同一張（失敗也不影響本次遊玩）
+      try { await savePhoto(blob); }
+      catch (e) { console.warn('照片無法保存，本次仍可正常遊玩。', e); }
+
+      const texture = await blobToTexture(blob);
+      const old = sourceTexture;
+      sourceTexture = texture;
+
+      hideStart();
+      buildGame();
+
+      if (old) { try { old.destroy(true); } catch (e) { /* ignore */ } }
+    } catch (e) {
+      console.error(e);
+      alert('這張照片讀取失敗，換一張再試試看。');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  /* ---------- 事件綁定 ---------- */
+
+  shuffleBtn.addEventListener('click', () => {
+    if (!sourceTexture) { openPicker(); return; }
+    buildGame();
+  });
   playAgainBtn.addEventListener('click', buildGame);
   levelBtn.addEventListener('click', () => {
+    if (!sourceTexture) { openPicker(); return; }
     levelIndex = (levelIndex + 1) % levels.length;
     buildGame();
   });
   bindHoldPreview();
+
+  pickPhotoBtn.addEventListener('click', openPicker);
+  changePhotoBtn.addEventListener('click', openPicker);
+  winChangeBtn.addEventListener('click', openPicker);
+  photoInput.addEventListener('change', (event) => {
+    const file = event.target.files && event.target.files[0];
+    event.target.value = '';   // 允許重複選同一個檔案
+    setPhotoFromFile(file);
+  });
 
   let resizeTimer = null;
   window.addEventListener('resize', () => {
@@ -348,13 +511,22 @@
     resizeTimer = setTimeout(buildGame, 180);
   });
 
-  PIXI.Assets.load(IMAGE_URL)
-    .then(texture => {
-      sourceTexture = texture;
-      buildGame();
-    })
-    .catch(error => {
-      console.error(error);
-      mount.innerHTML = '<div style="padding:24px;text-align:center">圖片載入失敗，請確認 puzzle-image.png 與 index.html 位於同一資料夾。</div>';
-    });
+  /* ---------- 啟動 ---------- */
+
+  (async function init() {
+    let saved = null;
+    try { saved = await loadPhoto(); } catch (e) { saved = null; }
+
+    if (saved) {
+      try {
+        sourceTexture = await blobToTexture(saved);
+        hideStart();
+        buildGame();
+        return;
+      } catch (e) {
+        console.warn('已保存的照片讀取失敗，請重新選擇。', e);
+      }
+    }
+    showStart();
+  })();
 })();
